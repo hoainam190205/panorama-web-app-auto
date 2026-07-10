@@ -14,7 +14,11 @@ class StitchConfig:
     lowe_ratio: float = 0.75
     ransac_threshold: float = 4.0
     max_width: int = 1200
+    canny_low: int = 75
+    canny_high: int = 150
     blend: str = "feather"          # "none" or "feather"
+    crop_mode: str = "strict"       # "strict", "soft", or "bbox"
+    crop_margin: int = 0
     max_matches_to_draw: int = 80
 
 
@@ -45,6 +49,22 @@ def preprocess(img: np.ndarray, max_width: int = 1200) -> Tuple[np.ndarray, np.n
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 1.2)
     return resized, gray, blur
+
+
+def compute_canny(blur_gray: np.ndarray, low: int = 75, high: int = 150) -> np.ndarray:
+    """Compute Canny edge map from a blurred grayscale image.
+
+    Canny is used as an intermediate visualization/analysis step. It helps show
+    whether the input images have enough strong edges and structure in the
+    overlap region before feature matching and RANSAC.
+    """
+    low = int(low)
+    high = int(high)
+    if low < 0 or high <= 0:
+        raise ValueError("Canny thresholds must be positive.")
+    if low >= high:
+        raise ValueError("canny_low must be smaller than canny_high.")
+    return cv2.Canny(blur_gray, low, high)
 
 
 def create_detector(detector: str, nfeatures: int):
@@ -141,18 +161,145 @@ def feather_blend(img1: np.ndarray, mask1: np.ndarray, img2: np.ndarray, mask2: 
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def auto_crop(img: np.ndarray, margin: int = 0) -> np.ndarray:
-    mask = safe_mask(img)
+def _bbox_from_mask(mask: np.ndarray, margin: int = 0) -> Tuple[int, int, int, int]:
     ys, xs = np.where(mask > 0)
     if len(xs) == 0 or len(ys) == 0:
-        return img
-    x1, x2 = xs.min(), xs.max()
-    y1, y2 = ys.min(), ys.max()
+        return 0, 0, mask.shape[1] - 1, mask.shape[0] - 1
+    x1, x2 = int(xs.min()), int(xs.max())
+    y1, y2 = int(ys.min()), int(ys.max())
     x1 = max(0, x1 - margin)
     y1 = max(0, y1 - margin)
-    x2 = min(img.shape[1] - 1, x2 + margin)
-    y2 = min(img.shape[0] - 1, y2 + margin)
-    return img[y1:y2 + 1, x1:x2 + 1].copy()
+    x2 = min(mask.shape[1] - 1, x2 + margin)
+    y2 = min(mask.shape[0] - 1, y2 + margin)
+    return x1, y1, x2, y2
+
+
+def _soft_crop_bbox(mask: np.ndarray, min_valid_ratio: float = 0.98, margin: int = 0) -> Tuple[int, int, int, int]:
+    """Iteratively trim border rows/columns that contain too much invalid area.
+
+    This keeps more image content than the strict crop, but it may leave a few
+    black pixels in the corners if the warped panorama has strong perspective skew.
+    """
+    m = (mask > 0).astype(np.uint8)
+    y1, y2 = 0, m.shape[0] - 1
+    x1, x2 = 0, m.shape[1] - 1
+
+    changed = True
+    while changed and y1 < y2 and x1 < x2:
+        changed = False
+        width = max(x2 - x1 + 1, 1)
+        height = max(y2 - y1 + 1, 1)
+
+        if m[y1, x1:x2 + 1].sum() / width < min_valid_ratio:
+            y1 += 1
+            changed = True
+        if m[y2, x1:x2 + 1].sum() / width < min_valid_ratio:
+            y2 -= 1
+            changed = True
+        if m[y1:y2 + 1, x1].sum() / height < min_valid_ratio:
+            x1 += 1
+            changed = True
+        if m[y1:y2 + 1, x2].sum() / height < min_valid_ratio:
+            x2 -= 1
+            changed = True
+
+    x1 = max(0, x1 - margin)
+    y1 = max(0, y1 - margin)
+    x2 = min(m.shape[1] - 1, x2 + margin)
+    y2 = min(m.shape[0] - 1, y2 + margin)
+    return x1, y1, x2, y2
+
+
+def _largest_inner_rectangle_bbox(mask: np.ndarray, margin: int = 0) -> Tuple[int, int, int, int]:
+    """Find the largest axis-aligned rectangle containing only valid pixels.
+
+    This is the most aggressive crop mode. It removes black triangles caused by
+    perspective warp, but it can cut more content than a simple bounding-box crop.
+    """
+    binary = (mask > 0).astype(np.uint8)
+    h, w = binary.shape
+    if h == 0 or w == 0 or binary.sum() == 0:
+        return 0, 0, w - 1, h - 1
+
+    heights = np.zeros(w, dtype=np.int32)
+    best_area = 0
+    best = (0, 0, w - 1, h - 1)
+
+    for y in range(h):
+        heights = heights + binary[y]
+        heights[binary[y] == 0] = 0
+        stack: List[Tuple[int, int]] = []  # (start_x, height)
+        for x in range(w + 1):
+            cur_h = int(heights[x]) if x < w else 0
+            start = x
+            while stack and stack[-1][1] > cur_h:
+                prev_start, prev_h = stack.pop()
+                area = prev_h * (x - prev_start)
+                if area > best_area:
+                    best_area = area
+                    best = (prev_start, y - prev_h + 1, x - 1, y)
+                start = prev_start
+            stack.append((start, cur_h))
+
+    x1, y1, x2, y2 = best
+    # A positive margin here means keep a tiny safety gap inside the valid region.
+    x1 = min(max(0, x1 + margin), w - 1)
+    y1 = min(max(0, y1 + margin), h - 1)
+    x2 = max(min(w - 1, x2 - margin), x1)
+    y2 = max(min(h - 1, y2 - margin), y1)
+    return x1, y1, x2, y2
+
+
+def auto_crop(
+    img: np.ndarray,
+    margin: int = 0,
+    mode: str = "strict",
+    valid_mask: Optional[np.ndarray] = None,
+    return_info: bool = False,
+):
+    """Crop panorama after warp.
+
+    Modes:
+      - bbox: crop to bounding box of all valid pixels; keeps most content but may keep black triangles.
+      - soft: iteratively removes mostly-black border rows/columns; balanced.
+      - strict: largest inner rectangle containing only valid pixels; removes black borders most strongly.
+    """
+    if valid_mask is None:
+        valid_mask = safe_mask(img)
+    else:
+        valid_mask = (valid_mask > 0).astype(np.uint8)
+
+    mode = (mode or "strict").lower().strip()
+    if mode in {"bbox", "bounding", "bounding_box"}:
+        x1, y1, x2, y2 = _bbox_from_mask(valid_mask, margin=margin)
+        resolved_mode = "bbox"
+    elif mode in {"soft", "balanced", "content"}:
+        x1, y1, x2, y2 = _soft_crop_bbox(valid_mask, min_valid_ratio=0.98, margin=margin)
+        resolved_mode = "soft"
+    elif mode in {"strict", "inner", "no_black", "largest_inner"}:
+        x1, y1, x2, y2 = _largest_inner_rectangle_bbox(valid_mask, margin=max(0, margin))
+        resolved_mode = "strict"
+    else:
+        raise ValueError("crop_mode must be 'strict', 'soft', or 'bbox'.")
+
+    cropped = img[y1:y2 + 1, x1:x2 + 1].copy()
+    raw_area = float(img.shape[0] * img.shape[1])
+    crop_area = float(max(0, y2 - y1 + 1) * max(0, x2 - x1 + 1))
+    info = {
+        "crop_mode": resolved_mode,
+        "crop_x1": float(x1),
+        "crop_y1": float(y1),
+        "crop_x2": float(x2),
+        "crop_y2": float(y2),
+        "raw_width": float(img.shape[1]),
+        "raw_height": float(img.shape[0]),
+        "cropped_width": float(cropped.shape[1]),
+        "cropped_height": float(cropped.shape[0]),
+        "crop_removed_percent": float(100.0 * (1.0 - crop_area / max(raw_area, 1.0))),
+    }
+    if return_info:
+        return cropped, info
+    return cropped
 
 
 def warp_left_to_right(left: np.ndarray, right: np.ndarray, H_left_to_right: np.ndarray, blend: str = "feather"):
@@ -174,13 +321,21 @@ def warp_left_to_right(left: np.ndarray, right: np.ndarray, H_left_to_right: np.
         raise RuntimeError("Canvas warp bất thường. Homography có thể sai do match/outlier.")
 
     T = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
-    warped_left = cv2.warpPerspective(left, T @ H_left_to_right, (out_w, out_h))
+    warp_matrix = T @ H_left_to_right
+    warped_left = cv2.warpPerspective(left, warp_matrix, (out_w, out_h))
+
+    # Use warped all-ones masks instead of pixel intensity masks. This avoids
+    # treating real dark pixels/shadows as black border.
+    left_valid_src = np.ones((h1, w1), dtype=np.uint8) * 255
+    mask_left = cv2.warpPerspective(left_valid_src, warp_matrix, (out_w, out_h))
+    mask_left = (mask_left > 0).astype(np.uint8)
 
     canvas_right = np.zeros((out_h, out_w, 3), dtype=np.uint8)
     canvas_right[ty:ty + h2, tx:tx + w2] = right
+    mask_right = np.zeros((out_h, out_w), dtype=np.uint8)
+    mask_right[ty:ty + h2, tx:tx + w2] = 1
 
-    mask_left = safe_mask(warped_left)
-    mask_right = safe_mask(canvas_right)
+    valid_mask = ((mask_left > 0) | (mask_right > 0)).astype(np.uint8)
 
     if blend == "none":
         pano = warped_left.copy()
@@ -188,12 +343,25 @@ def warp_left_to_right(left: np.ndarray, right: np.ndarray, H_left_to_right: np.
     else:
         pano = feather_blend(warped_left, mask_left, canvas_right, mask_right)
 
-    return pano, warped_left, canvas_right
+    return pano, warped_left, canvas_right, valid_mask
+
+
+def _visualize_crop_on_mask(mask: np.ndarray, crop_info: Dict[str, float]) -> np.ndarray:
+    vis = (mask.astype(np.uint8) * 255)
+    vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+    x1 = int(crop_info["crop_x1"])
+    y1 = int(crop_info["crop_y1"])
+    x2 = int(crop_info["crop_x2"])
+    y2 = int(crop_info["crop_y2"])
+    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 3)
+    return vis
 
 
 def stitch_pair(left_bgr: np.ndarray, right_bgr: np.ndarray, cfg: StitchConfig) -> StitchResult:
     left, left_gray, left_blur = preprocess(left_bgr, cfg.max_width)
     right, right_gray, right_blur = preprocess(right_bgr, cfg.max_width)
+    left_canny = compute_canny(left_blur, cfg.canny_low, cfg.canny_high)
+    right_canny = compute_canny(right_blur, cfg.canny_low, cfg.canny_high)
 
     kp1, desc1 = detect_and_compute(left_blur, cfg)
     kp2, desc2 = detect_and_compute(right_blur, cfg)
@@ -215,8 +383,15 @@ def stitch_pair(left_bgr: np.ndarray, right_bgr: np.ndarray, cfg: StitchConfig) 
     if inlier_ratio < 0.15:
         raise RuntimeError(f"Inlier ratio thấp ({inlier_ratio:.2f}). Ảnh có thể không cùng cảnh/overlap kém.")
 
-    panorama_raw, warped_left, canvas_right = warp_left_to_right(left, right, H, cfg.blend)
-    panorama = auto_crop(panorama_raw)
+    panorama_raw, warped_left, canvas_right, valid_mask = warp_left_to_right(left, right, H, cfg.blend)
+    panorama, crop_info = auto_crop(
+        panorama_raw,
+        margin=cfg.crop_margin,
+        mode=cfg.crop_mode,
+        valid_mask=valid_mask,
+        return_info=True,
+    )
+    crop_mask_vis = _visualize_crop_on_mask(valid_mask, crop_info)
 
     raw_vis = cv2.drawMatchesKnn(
         left, kp1, right, kp2, raw_matches[: cfg.max_matches_to_draw], None,
@@ -244,8 +419,17 @@ def stitch_pair(left_bgr: np.ndarray, right_bgr: np.ndarray, cfg: StitchConfig) 
         "inliers": float(inlier_count),
         "inlier_ratio": float(inlier_ratio),
         "mean_reprojection_error": float(mean_err),
+        "canny_low_threshold": float(cfg.canny_low),
+        "canny_high_threshold": float(cfg.canny_high),
+        "panorama_raw_width": float(panorama_raw.shape[1]),
+        "panorama_raw_height": float(panorama_raw.shape[0]),
         "panorama_width": float(panorama.shape[1]),
         "panorama_height": float(panorama.shape[0]),
+        "crop_removed_percent": float(crop_info["crop_removed_percent"]),
+        "crop_x1": float(crop_info["crop_x1"]),
+        "crop_y1": float(crop_info["crop_y1"]),
+        "crop_x2": float(crop_info["crop_x2"]),
+        "crop_y2": float(crop_info["crop_y2"]),
     }
 
     intermediates = {
@@ -253,6 +437,8 @@ def stitch_pair(left_bgr: np.ndarray, right_bgr: np.ndarray, cfg: StitchConfig) 
         "right_resized": right,
         "left_blur_gray": left_blur,
         "right_blur_gray": right_blur,
+        "left_canny": left_canny,
+        "right_canny": right_canny,
         "keypoints_left": keypoints_left,
         "keypoints_right": keypoints_right,
         "raw_matches": raw_vis,
@@ -260,11 +446,12 @@ def stitch_pair(left_bgr: np.ndarray, right_bgr: np.ndarray, cfg: StitchConfig) 
         "inlier_matches": inlier_vis,
         "warped_left": warped_left,
         "canvas_right": canvas_right,
+        "valid_mask": valid_mask * 255,
+        "crop_mask": crop_mask_vis,
         "panorama_raw": panorama_raw,
+        "panorama_cropped": panorama,
     }
     return StitchResult(panorama=panorama, metrics=metrics, intermediates=intermediates)
-
-
 
 @dataclass
 class AutoOrderResult:

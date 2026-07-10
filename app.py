@@ -34,7 +34,31 @@ with st.sidebar:
     lowe_ratio = st.slider("Lowe ratio", 0.50, 0.95, 0.75, 0.05)
     ransac_threshold = st.slider("RANSAC threshold (px)", 1.0, 10.0, 4.0, 0.5)
     max_width = st.slider("Resize max width", 500, 1800, 1100, 100)
+    canny_low = st.slider("Canny threshold low", 10, 200, 75, 5)
+    canny_high = st.slider("Canny threshold high", 50, 300, 150, 5)
+    if canny_low >= canny_high:
+        st.warning("Canny low nên nhỏ hơn Canny high.")
     blend = st.selectbox("Blending", ["feather", "none"], index=0)
+
+    st.divider()
+    st.header("Giảm viền đen")
+    crop_label = st.selectbox(
+        "Auto crop mode",
+        [
+            "strict - cắt mạnh, giảm viền đen nhiều nhất",
+            "soft - cân bằng, giữ ảnh nhiều hơn",
+            "bbox - chỉ cắt khung ngoài, giữ nhiều ảnh nhất",
+        ],
+        index=0,
+    )
+    crop_mode = crop_label.split(" - ")[0]
+    crop_margin = st.slider(
+        "Crop safety margin (px)",
+        0, 30, 0, 1,
+        help="Với strict crop, margin càng lớn thì cắt sâu hơn một chút để tránh sót viền đen mảnh.",
+    )
+    st.caption("Gợi ý: dùng strict để ảnh ít viền đen nhất; dùng soft/bbox nếu bị cắt mất quá nhiều nội dung.")
+
     max_matches_to_draw = st.slider("Số match hiển thị", 20, 200, 80, 10)
 
     st.divider()
@@ -60,7 +84,11 @@ cfg = StitchConfig(
     lowe_ratio=lowe_ratio,
     ransac_threshold=ransac_threshold,
     max_width=max_width,
+    canny_low=canny_low,
+    canny_high=canny_high,
     blend=blend,
+    crop_mode=crop_mode,
+    crop_margin=crop_margin,
     max_matches_to_draw=max_matches_to_draw,
 )
 
@@ -178,27 +206,42 @@ if uploaded_files:
 
                 st.subheader("5. Ảnh trung gian")
                 tabs = st.tabs([
-                    "Preprocess", "Keypoints", "Matches", "RANSAC Inliers", "Warp", "Raw Panorama"
+                    "Preprocess", "Canny", "Keypoints", "Matches", "RANSAC Inliers", "Warp", "Crop", "Raw Panorama"
                 ])
                 with tabs[0]:
                     c1, c2 = st.columns(2)
                     with c1:
                         st.image(bgr_to_rgb(result.intermediates["left_resized"]), caption="Left/current resized", use_container_width=True)
+                        st.image(result.intermediates["left_blur_gray"], caption="Left/current grayscale + Gaussian blur", use_container_width=True)
                     with c2:
                         st.image(bgr_to_rgb(result.intermediates["right_resized"]), caption="Right/next resized", use_container_width=True)
+                        st.image(result.intermediates["right_blur_gray"], caption="Right/next grayscale + Gaussian blur", use_container_width=True)
                 with tabs[1]:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.image(result.intermediates["left_canny"], caption="Left/current Canny edge map", use_container_width=True)
+                    with c2:
+                        st.image(result.intermediates["right_canny"], caption="Right/next Canny edge map", use_container_width=True)
+                with tabs[2]:
                     c1, c2 = st.columns(2)
                     with c1:
                         st.image(bgr_to_rgb(result.intermediates["keypoints_left"]), caption="Keypoints left/current", use_container_width=True)
                     with c2:
                         st.image(bgr_to_rgb(result.intermediates["keypoints_right"]), caption="Keypoints right/next", use_container_width=True)
-                with tabs[2]:
-                    st.image(bgr_to_rgb(result.intermediates["good_matches"]), caption="Good matches sau Lowe ratio", use_container_width=True)
                 with tabs[3]:
-                    st.image(bgr_to_rgb(result.intermediates["inlier_matches"]), caption="Inlier matches sau RANSAC", use_container_width=True)
+                    st.image(bgr_to_rgb(result.intermediates["good_matches"]), caption="Good matches sau Lowe ratio", use_container_width=True)
                 with tabs[4]:
-                    st.image(bgr_to_rgb(result.intermediates["warped_left"]), caption="Warped current image", use_container_width=True)
+                    st.image(bgr_to_rgb(result.intermediates["inlier_matches"]), caption="Inlier matches sau RANSAC", use_container_width=True)
                 with tabs[5]:
+                    st.image(bgr_to_rgb(result.intermediates["warped_left"]), caption="Warped current image", use_container_width=True)
+                with tabs[6]:
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.image(result.intermediates["valid_mask"], caption="Valid mask: vùng có dữ liệu ảnh thật", use_container_width=True)
+                    with c2:
+                        st.image(bgr_to_rgb(result.intermediates["crop_mask"]), caption="Crop rectangle sau khi tối ưu giảm viền đen", use_container_width=True)
+                    st.image(bgr_to_rgb(result.intermediates["panorama_cropped"]), caption="Panorama sau auto crop", use_container_width=True)
+                with tabs[7]:
                     st.image(bgr_to_rgb(result.intermediates["panorama_raw"]), caption="Panorama trước auto crop", use_container_width=True)
 
                 st.subheader("6. Tham số đã sử dụng")
@@ -209,7 +252,10 @@ N_FEATURES: {cfg.nfeatures}
 Lowe ratio: {cfg.lowe_ratio}
 RANSAC threshold: {cfg.ransac_threshold} px
 Resize max width: {cfg.max_width} px
+Canny threshold: {cfg.canny_low}/{cfg.canny_high}
 Blending: {cfg.blend}
+Crop mode: {cfg.crop_mode}
+Crop margin: {cfg.crop_margin}px
 Order mode: {order_mode}
 Auto-order min inliers: {min_order_inliers}
 Auto-order min inlier ratio: {min_order_ratio}
@@ -235,6 +281,6 @@ else:
 st.divider()
 st.markdown(
     """
-**Kỹ thuật trong pipeline:** Gaussian Blur, SIFT/ORB Feature Detection, BFMatcher, Lowe Ratio Test, RANSAC Homography, Perspective Warp, Feather Blending, Auto Crop, Pairwise Matching Graph for Auto-order.
+**Kỹ thuật trong pipeline:** Gaussian Blur, Canny Edge Detection, SIFT/ORB Feature Detection, BFMatcher, Lowe Ratio Test, RANSAC Homography, Perspective Warp, Feather Blending, Smart Auto Crop giảm viền đen, Pairwise Matching Graph for Auto-order.
 """
 )
